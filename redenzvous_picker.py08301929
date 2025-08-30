@@ -1,0 +1,160 @@
+# rendezvous_picker.py
+import numpy as np
+import math
+from collections import deque
+from parameter import *
+from utils import get_cell_position_from_coords, MapInfo
+
+def pick_rendezvous_point(worker):
+    """
+    基于UDRS思想重写的Rendezvous Point Picker.
+    在预测地图的高不确定性区域中，寻找一个平衡探索收益和集合成本的最佳会合点。
+
+    返回: (center_xy, r_meet, T_meet, meta)
+        - center_xy (np.array): 会合点世界坐标
+        - r_meet (float): 会合半径
+        - T_meet (int): 绝对会合时间步 (episode step)
+        - meta (dict): 调试信息
+    """
+    # --- 0. 准备工作 ---
+    a0 = worker.robots[0]
+    if a0.pred_mean_map_info is None:
+        return None, 0.0, 0, {'reason': 'no_prediction_map'}
+
+    pred_map = a0.pred_mean_map_info.map.astype(np.float32)
+    belief_map = a0.map_info.map
+    H, W = pred_map.shape
+    cell_size = float(a0.cell_size)
+
+    # --- 1. 定义可通行区域 (Traversable Mask) ---
+    # 规则：预测为Free的区域 或 已知为Free的区域，且不能是已知障碍
+    prob_free = pred_map / float(FREE)
+    tau_free = 0.6  # 预测为Free的置信度阈值
+    traversable_mask = ((prob_free >= tau_free) | (belief_map == FREE)) & (belief_map != OCCUPIED)
+
+    # --- 2. 生成候选点 (Candidate Generation) ---
+    # 规则：必须是高不确定性区域 (即，当前未知)
+    unknown_mask = (belief_map == UNKNOWN)
+    high_uncertainty_mask = (prob_free >= tau_free) & unknown_mask
+    
+    cand_rows, cand_cols = np.where(high_uncertainty_mask)
+    if cand_rows.size == 0:
+        return None, 0.0, 0, {'reason': 'no_candidate_points_in_unknown_area'}
+    
+    # 限制候选点数量，避免计算量过大
+    num_candidates = min(cand_rows.size, 200)
+    indices = np.random.choice(cand_rows.size, num_candidates, replace=False)
+    candidate_cells = np.stack([cand_rows[indices], cand_cols[indices]], axis=1)
+
+    # --- 3. 计算所有机器人到所有栅格的距离场 (Distance Fields) ---
+    dist_maps_meters = []
+    for r in worker.robots:
+        start_cell = _world_to_cell_rc(r.location, a0.map_info)
+        # 如果起点不可通行，找到最近的可通行点
+        if not traversable_mask[start_cell[0], start_cell[1]]:
+            start_cell = _find_nearest_valid_cell(traversable_mask, start_cell)
+        
+        dist_map_steps = _bfs_dist_map(traversable_mask, start_cell)
+        dist_maps_meters.append(dist_map_steps * cell_size)
+
+    # --- 4. 评估所有候选点 ---
+    best_candidate = None
+    max_score = -np.inf
+
+    # 权重
+    W_INFO_GAIN = 0.6
+    W_TRAVEL_COST = 0.4
+
+    for r, c in candidate_cells:
+        # 4.1. 计算集合成本 (Travel Cost)
+        travel_distances = [dist_map[r, c] for dist_map in dist_maps_meters]
+        if any(not np.isfinite(d) for d in travel_distances):
+            continue # 如果有机器人无法到达该点，则跳过
+        
+        max_travel_dist = np.max(travel_distances)
+        
+        # 将成本归一化 (地图对角线作为最大可能成本)
+        map_diagonal = math.hypot(H * cell_size, W * cell_size)
+        travel_cost_score = max_travel_dist / map_diagonal
+
+        # 4.2. 计算信息增益 (Info Gain)
+        # 简化为候选点本身的不确定性（预测为Free的概率）
+        info_gain_score = prob_free[r, c]
+
+        # 4.3. 总分
+        score = W_INFO_GAIN * info_gain_score - W_TRAVEL_COST * travel_cost_score
+        
+        if score > max_score:
+            max_score = score
+            best_candidate = {
+                'cell': (r, c),
+                'max_dist': max_travel_dist,
+                'score': score
+            }
+
+    if best_candidate is None:
+        return None, 0.0, 0, {'reason': 'no_reachable_candidate_found'}
+
+    # --- 5. 生成会合任务 ---
+    # 5.1. 位置和半径
+    best_cell = best_candidate['cell']
+    center_xy = _cell_to_world(best_cell, a0.map_info)
+    r_meet = float(MEET_RADIUS_FRAC * COMMS_RANGE)
+
+    # 5.2. 时间
+    # 将最大距离（米）转换为步数
+    max_dist_m = best_candidate['max_dist']
+    steps_to_reach = max_dist_m / NODE_RESOLUTION  # 每步移动一个节点的距离
+    
+    # 增加时间缓冲
+    buffer_steps = MEET_BUFFER_ALPHA * steps_to_reach + MEET_BUFFER_BETA
+    
+    # 计算绝对会合时间步
+    current_step = worker.global_step # 假设worker有global_step属性记录当前总步数，或者从env里拿
+    T_meet = int(current_step + steps_to_reach + buffer_steps)
+
+    meta = {'score': best_candidate['score']}
+    
+    return center_xy, r_meet, T_meet, meta
+
+
+# --- Helper Functions ---
+
+def _world_to_cell_rc(world_xy, map_info):
+    cell = get_cell_position_from_coords(np.array(world_xy, dtype=float), map_info)
+    return int(cell[1]), int(cell[0])
+
+def _cell_to_world(rc, map_info):
+    r, c = rc
+    x = map_info.map_origin_x + c * map_info.cell_size
+    y = map_info.map_origin_y + r * map_info.cell_size
+    return np.array([x, y])
+
+def _find_nearest_valid_cell(mask, start_rc):
+    q = deque([start_rc])
+    visited = {start_rc}
+    while q:
+        r, c = q.popleft()
+        if mask[r, c]:
+            return r, c
+        for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < mask.shape[0] and 0 <= nc < mask.shape[1] and (nr, nc) not in visited:
+                q.append((nr, nc))
+                visited.add((nr, nc))
+    return start_rc # Fallback
+
+def _bfs_dist_map(traversable_mask, start_rc):
+    H, W = traversable_mask.shape
+    dist_map = np.full((H, W), np.inf, dtype=np.float32)
+    q = deque([(start_rc, 0)])
+    dist_map[start_rc] = 0
+    
+    while q:
+        (r, c), dist = q.popleft()
+        for dr, dc in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+            nr, nc = r + dr, c + dc
+            if 0 <= nr < H and 0 <= nc < W and traversable_mask[nr, nc] and dist_map[nr, nc] == np.inf:
+                dist_map[nr, nc] = dist + 1
+                q.append(((nr, nc), dist + 1))
+    return dist_map
